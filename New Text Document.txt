@@ -1,0 +1,150 @@
+import os, uuid, zipfile, tempfile
+from fastapi import FastAPI, UploadFile, Form
+from fastapi.responses import HTMLResponse
+from moviepy.editor import VideoFileClip, concatenate_videoclips, vfx, TextClip, CompositeVideoClip
+import yt_dlp
+import whisper
+from googletrans import Translator
+from moviepy.audio.io.AudioFileClip import AudioFileClip
+import numpy as np
+
+app = FastAPI()
+whisper_model = whisper.load_model("small")
+translator = Translator()
+
+# ---------- FRONTEND ----------
+html_page = """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ultimate Viral Shorts Generator</title>
+<style>
+body { font-family: Arial, sans-serif; padding: 20px; background: #f5f7fa; color: #222; }
+h1 { color: #0ea5a4; }
+button { padding:10px 16px;background:#0ea5a4;color:#fff;border:none;border-radius:6px; cursor:pointer; }
+button:hover{background:#0c8f90;}
+#status{margin-top:15px;font-weight:bold;}
+</style>
+</head>
+<body>
+<h1>🎬 Ultimate Viral Shorts Generator</h1>
+<form id="uploadForm">
+<label>YouTube Link:</label><br>
+<input type="text" name="youtube_url" placeholder="Paste YouTube URL"><br><br>
+<label>or Upload Video:</label><br>
+<input type="file" name="file"><br><br>
+<label>Language (for subtitle translation):</label><br>
+<input type="text" name="lang" placeholder="en, hi, es, fr"><br><br>
+<button type="submit">Generate</button>
+</form>
+<p id="status"></p>
+<script>
+const form = document.getElementById("uploadForm");
+const statusEl = document.getElementById("status");
+form.addEventListener("submit", async (e) => {
+e.preventDefault();
+statusEl.textContent = "Processing... This may take a few minutes.";
+const formData = new FormData(form);
+try {
+const res = await fetch("/api/process", { method:"POST", body: formData });
+const data = await res.json();
+statusEl.innerHTML = "✅ Done! Download: <a href='"+data.file+"' target='_blank'>"+data.file+"</a>";
+} catch(err) {
+statusEl.textContent = "❌ Error: " + err.message;
+}
+});
+</script>
+</body>
+</html>
+"""
+
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    return HTMLResponse(content=html_page)
+
+# ---------- UTILITY FUNCTIONS ----------
+def crop_vertical(clip: VideoFileClip, target_height=1080):
+    clip_resized = clip.resize(height=target_height)
+    w,h = clip_resized.size
+    target_w = int(target_height*9/16)
+    if w>=target_w:
+        x_center = w/2
+        clip_final = clip_resized.fx(vfx.crop, x_center=x_center, y_center=h/2, width=target_w, height=target_height)
+    else:
+        clip_final = clip_resized
+    return clip_final
+
+def add_subtitle_and_watermark(clip: VideoFileClip, text:str, lang="en"):
+    try:
+        translated = translator.translate(text, dest=lang).text
+    except:
+        translated = text
+    txt_clip = TextClip(translated, fontsize=28, color='white', stroke_color='black', method='caption', size=clip.size)
+    txt_clip = txt_clip.set_duration(clip.duration).set_position(("center","bottom"))
+    watermark = TextClip("MyBrand", fontsize=22, color="yellow").set_duration(clip.duration).set_position(("right","top"))
+    final = CompositeVideoClip([clip, txt_clip, watermark])
+    return final
+
+def detect_engaging_segments(video_path, segment_length=20, top_segments=3):
+    # Detect top segments using audio peaks
+    clip = VideoFileClip(video_path)
+    audio = clip.audio
+    fps = 10  # sample fps
+    samples = audio.to_soundarray(fps=fps)
+    amplitude = np.mean(np.abs(samples), axis=1)
+    chunk_len = int(segment_length*fps)
+    scores = []
+    for i in range(0,len(amplitude)-chunk_len, chunk_len):
+        scores.append((np.mean(amplitude[i:i+chunk_len]), i/fps))
+    scores.sort(reverse=True)
+    top_times = [s[1] for s in scores[:top_segments]]
+    segments = []
+    for t in top_times:
+        start = t
+        end = min(t+segment_length, clip.duration)
+        segments.append(clip.subclip(start,end))
+    return segments
+
+def generate_shorts(video_path, lang="en"):
+    segments = detect_engaging_segments(video_path)
+    tmp_dir = tempfile.mkdtemp()
+    file_list = []
+    for idx, clip in enumerate(segments):
+        clip_v = crop_vertical(clip)
+        result = whisper_model.transcribe(video_path, fp16=False)
+        text = result.get("text","")
+        final_clip = add_subtitle_and_watermark(clip_v, text, lang)
+        file_name = os.path.join(tmp_dir, f"short_{idx}.mp4")
+        final_clip.write_videofile(file_name, codec="libx264", audio_codec="aac", verbose=False, logger=None)
+        clip.close()
+        clip_v.close()
+        final_clip.close()
+        file_list.append(file_name)
+    return file_list
+
+# ---------- PROCESS ROUTE ----------
+@app.post("/api/process")
+async def process_video(youtube_url: str = Form(None), file: UploadFile = None, lang: str = Form("en")):
+    out_file = f"input_{uuid.uuid4().hex}.mp4"
+
+    if youtube_url:
+        ydl_opts = {"outtmpl": out_file}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([youtube_url])
+    if file:
+        with open(out_file, "wb") as f:
+            f.write(await file.read())
+
+    short_files = generate_shorts(out_file)
+
+    # Create ZIP
+    zip_name = f"shorts_{uuid.uuid4().hex}.zip"
+    with zipfile.ZipFile(zip_name, 'w') as zipf:
+        for f in short_files:
+            zipf.write(f, os.path.basename(f))
+            os.remove(f)
+    os.remove(out_file)
+
+    return {"status":"ok","file":zip_name}
